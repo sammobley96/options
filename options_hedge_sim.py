@@ -7,7 +7,7 @@ from math import log, sqrt, exp
 from scipy.stats import norm
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Options Hedge Optimizer — Multi-Structure + Optimizer", layout="wide")
+st.set_page_config(page_title="Options Hedge Optimizer — Scenario v9", layout="wide")
 plt.rcParams["axes.unicode_minus"] = False
 
 # ---------- Black-Scholes ----------
@@ -23,79 +23,17 @@ def bs_price(S, K, T, r, sigma, option_type):
 
 def bs_delta(S, K, T, sigma, option_type):
     if T <= 0 or sigma <= 0:
-        return 1.0 if option_type == "C" and S > K else 0.0
+        # intrinsic-only edge cases
+        if option_type == "C":
+            return 1.0 if S > K else 0.0
+        else:
+            return -1.0 if S < K else 0.0
     d1 = (log(S / K) + (0.5 * sigma**2) * T) / (sigma * sqrt(T))
-    return norm.cdf(d1) if option_type == "C" else norm.cdf(d1) - 1
+    return norm.cdf(d1) if option_type == "C" else norm.cdf(d1) - 1.0
 
-# ---------- Header ----------
-st.title("🧭 Options Hedge Optimizer — Multi-Structure, Auto IV Crush, Live Data + Optimizer")
-st.markdown("""
-Each hedge ratio (20%, 50%, 80%) uses a **different option structure**.  
-Add your **Custom** ratio, and let the **Optimizer** suggest a hedge by either:
-- **Minimizing Worst-Case Downside** (below current price), or
-- **Maximizing Risk-Adjusted Return** (Sharpe-like) across the simulated price grid.
-
-All returns shown are **vs your cost basis**.
-""")
-
-# ---------- Inputs ----------
-col1, col2 = st.columns(2)
-with col1:
-    symbol = st.text_input("Stock Symbol", "MSFT").upper()
-    call_strike = st.number_input("Call Strike", value=565.0)
-    call_exp = st.text_input("Call Expiration (YYYY-MM-DD)", "2025-12-19")
-    num_calls = st.number_input("Number of Call Contracts", value=3, step=1)
-with col2:
-    call_cost_basis = st.number_input("Avg Cost per Call ($)", value=13.49)
-    days_until_exit = st.slider("Days Until Exit", 1, 30, 5)
-    manual_iv_crush = st.slider("Manual IV Crush (%)", 0, 50, 15)
-    custom_hedge_ratio = st.slider("Custom Hedge %", 0, 100, 65)
-
-st.divider()
-
-# ---------- Optimizer Controls ----------
-opt_cols = st.columns(3)
-with opt_cols[0]:
-    objective = st.selectbox(
-        "Optimizer Objective",
-        ["Minimize Worst-Case Downside", "Maximize Risk-Adjusted Return"]
-    )
-with opt_cols[1]:
-    sweep_enable = st.checkbox("Search 0–100% (step 5%) for optimal custom ratio", value=True)
-with opt_cols[2]:
-    downside_only_region = st.slider("Downside region width for 'worst-case' (as % below spot)", 5, 20, 10)
-
-# ---------- Constants ----------
-r = 0.05
-today = datetime.today()
-
-# ---------- Fetch spot (simple; Yahoo options are delayed anyway) ----------
-stock = yf.Ticker(symbol)
-hist = stock.history(period="1d")
-if hist.empty:
-    st.error("Could not fetch underlying price.")
-    st.stop()
-S0 = float(hist["Close"].iloc[-1])
-
-# ---------- Pull option chain for your call ----------
-try:
-    chain_main = stock.option_chain(call_exp)
-except Exception as e:
-    st.error(f"Could not fetch options for {call_exp}: {e}")
-    st.stop()
-
-calls_df = chain_main.calls
-call_row = calls_df[calls_df["strike"] == call_strike]
-if call_row.empty:
-    st.error(f"No {symbol} {call_strike} C for {call_exp}.")
-    st.stop()
-
-call_mid = float((call_row["bid"].iloc[0] + call_row["ask"].iloc[0]) / 2)
-call_iv = float(call_row["impliedVolatility"].iloc[0] * 100)
-st.caption(f"Using spot S0 = ${S0:.2f} | Your call mid ~ ${call_mid:.2f}, IV ~ {call_iv:.1f}%")
-
-# ---------- Helper: pick expiry closest to target days ----------
-def pick_exp(exp_list, target_days):
+# ---------- Helpers ----------
+def pick_exp(exp_list, target_days, today):
+    """Pick the expiration closest to target_days in the future."""
     parsed = []
     for d in exp_list:
         dt = datetime.strptime(d, "%Y-%m-%d")
@@ -106,260 +44,282 @@ def pick_exp(exp_list, target_days):
         return None
     return min(parsed, key=lambda x: abs(x[1] - target_days))[0]
 
-# ---------- Hedge templates (independent structures) ----------
-# 20%: cheaper tail hedge (deeper OTM, short)
-# 50%: balanced (near OTM, weekly)
-# 80%: deeper protection (closer to ATM, a bit longer)
-hedge_templates = {
-    20: {"otm_pct": 0.90, "days": 5,  "width_pct": 0.04},  # ~10% OTM, ~4% width
-    50: {"otm_pct": 0.96, "days": 7,  "width_pct": 0.04},  # ~4% OTM, ~4% width
-    80: {"otm_pct": 0.99, "days": 14, "width_pct": 0.03},  # ~1% OTM, ~3% width
-}
+def nearest_strike(strikes_series, target):
+    idx = (strikes_series - target).abs().argsort().iloc[0]
+    return float(strikes_series.iloc[idx])
 
-# ---------- Build hedge structure for a ratio using its template ----------
-def find_put_spread_for_ratio(ratio):
-    tmpl = hedge_templates.get(ratio, hedge_templates[50])
-    exp = pick_exp(stock.options, tmpl["days"])
-    if exp is None:
-        # fallback to nearest available
-        exps = stock.options
-        exp = exps[0] if exps else None
-    if exp is None:
-        st.error("No option expirations available.")
-        st.stop()
+def atm_iv_for_exp(ticker, exp, spot):
+    """Median IV of ~ATM calls (more robust than a single strike)."""
+    try:
+        ch = ticker.option_chain(exp)
+        calls = ch.calls.dropna(subset=["impliedVolatility", "strike"])
+        if calls.empty: 
+            return None
+        calls["dist"] = (calls["strike"] - spot).abs()
+        ivs = calls.nsmallest(5, "dist")["impliedVolatility"].values
+        return float(np.median(ivs) * 100) if ivs.size > 0 else None
+    except Exception:
+        return None
 
-    chain = stock.option_chain(exp)
-    puts = chain.puts.dropna(subset=["strike", "bid", "ask", "impliedVolatility"])
-    if puts.empty:
-        st.error(f"No puts available for {exp}.")
-        st.stop()
+def auto_iv_crush_estimate(ticker, spot, days_short, today):
+    """
+    Estimate IV crush from the term structure:
+    Compare ATM IV at ~days_short vs. ~4x days (capped at 60% crush).
+    """
+    try:
+        exps = ticker.options
+        if not exps:
+            return None, None, None
+        short_exp = pick_exp(exps, days_short, today)
+        long_exp  = pick_exp(exps, max(int(days_short * 4), days_short + 14), today)
+        iv_short = atm_iv_for_exp(ticker, short_exp, spot) if short_exp else None
+        iv_long  = atm_iv_for_exp(ticker, long_exp,  spot) if long_exp  else None
+        if iv_short and iv_long and iv_short > 0:
+            crush = max(0.0, min(((iv_short - iv_long) / iv_short) * 100.0, 60.0))
+            return crush, short_exp, long_exp
+        return None, short_exp, long_exp
+    except Exception:
+        return None, None, None
 
-    long_target = S0 * tmpl["otm_pct"]
-    width = S0 * tmpl["width_pct"]
+# ---------- UI: Position + Scenario ----------
+st.title("🎯 Options Hedge Optimizer — Scenario-driven (v9)")
 
-    # choose long strike closest to target
-    long_strike = float(puts.iloc[(puts["strike"] - long_target).abs().argsort()[:1]]["strike"])
-    # choose short strike lower by ~width
-    short_target = long_target - width
-    short_strike = float(puts.iloc[(puts["strike"] - short_target).abs().argsort()[:1]]["strike"])
+left, right = st.columns(2)
+with left:
+    symbol = st.text_input("Underlying", "MSFT").upper()
+    call_strike = st.number_input("Your Call Strike", value=565.0)
+    call_exp = st.text_input("Your Call Expiration (YYYY-MM-DD)", "2025-12-19")
+    num_calls = st.number_input("Number of Call Contracts", value=3, step=1)
+with right:
+    call_cost_basis = st.number_input("Avg Cost per Call ($)", value=13.49)
+    days_until_exit = st.slider("Days Until Exit (P/L snapshot horizon)", 1, 30, 5)
+    custom_hedge_ratio = st.slider("Custom Hedge %", 0, 100, 65)
 
-    row_long = puts[puts["strike"] == long_strike].iloc[0]
-    row_short = puts[puts["strike"] == short_strike].iloc[0]
+st.markdown("#### Scenario — what are you hedging against?")
+sc1, sc2, sc3 = st.columns([1,1,1])
+with sc1:
+    drop_pct = st.slider("💥 % Drop to Hedge", 1, 20, 5)
+with sc2:
+    risk_window_days = st.slider("⏳ Risk Window (days)", 1, 30, 3)
+with sc3:
+    expected_upside_pct = st.slider("🚀 Expected Upside (%)", 0, 20, 4)
 
-    long_mid = (row_long["bid"] + row_long["ask"]) / 2
-    short_mid = (row_short["bid"] + row_short["ask"]) / 2
-    spread_cost = float(long_mid - short_mid)
-    put_iv = float(row_long["impliedVolatility"] * 100)
+st.markdown("#### Volatility")
+v1, v2 = st.columns([1,1])
+with v1:
+    use_auto_iv = st.checkbox("Use automatic IV calibration", value=True)
+with v2:
+    manual_iv_crush = st.slider("Manual IV Crush (%) (if auto unavailable)", 0, 60, 15)
 
-    return {
-        "exp": exp,
-        "up": long_strike,
-        "low": short_strike,
-        "iv": put_iv,
-        "cost": spread_cost
-    }
+r = 0.05
+today = datetime.today()
 
-# ---------- Simulation per ratio & structure ----------
-def simulate_ratio(hedge_ratio, exp, up_strike, low_strike, iv_put, cost_basis):
-    # Size hedge contracts to target delta coverage
-    T_call = (datetime.strptime(call_exp, "%Y-%m-%d") - today).days / 365
-    delta_call = bs_delta(S0, call_strike, T_call, call_iv / 100, "C")
-    total_call_delta = delta_call * num_calls * 100
+# ---------- Fetch underlying ----------
+ticker = yf.Ticker(symbol)
+hist = ticker.history(period="1d")
+if hist.empty:
+    st.error("Could not fetch underlying price.")
+    st.stop()
+S0 = float(hist["Close"].iloc[-1])
+st.caption(f"Spot S0 = ${S0:.2f}")
 
-    T_put = (datetime.strptime(exp, "%Y-%m-%d") - today).days / 365
-    delta_put = abs(bs_delta(S0, up_strike, T_put, iv_put / 100, "P")) * 100
-    hedge_contracts = max(1, round((total_call_delta * (hedge_ratio / 100)) / delta_put))
+# ---------- Load user's call chain ----------
+try:
+    chain_call = ticker.option_chain(call_exp)
+except Exception as e:
+    st.error(f"Could not fetch your call chain for {call_exp}: {e}")
+    st.stop()
 
-    # Price grid
-    prices = np.arange(S0 * 0.9, S0 * 1.1, 2.0)
+calls_df = chain_call.calls
+call_row = calls_df[calls_df["strike"] == call_strike]
+if call_row.empty:
+    st.error(f"No {symbol} {call_strike} C for {call_exp}.")
+    st.stop()
 
-    # Exit-time vols / times
-    T_exit_call = (datetime.strptime(call_exp, "%Y-%m-%d") - today - timedelta(days=days_until_exit)).days / 365
-    iv_crush = manual_iv_crush  # (keep manual; swap for auto if you add that back)
-    iv_call_new = call_iv * (1 - iv_crush / 100)
-    iv_put_new = iv_put * (1 - iv_crush / 100)
+call_mid = float((call_row["bid"].iloc[0] + call_row["ask"].iloc[0]) / 2)
+call_iv_now = float(call_row["impliedVolatility"].iloc[0] * 100)
+st.caption(f"Your call mid ≈ ${call_mid:.2f}, IV ≈ {call_iv_now:.1f}%")
+
+# ---------- Scenario-driven hedge structure ----------
+# Expiry: nearest available AFTER your risk window (small +2d buffer)
+target_exp_days = int(risk_window_days + 2)
+exps = ticker.options
+if not exps:
+    st.error("No option expirations available.")
+    st.stop()
+
+hedge_exp = pick_exp(exps, target_exp_days, today)
+if hedge_exp is None:
+    st.error("Could not find a suitable hedge expiration.")
+    st.stop()
+
+# Strikes: long strike near S0 * (1 - drop_pct%), short strike lower by ~half that move
+try:
+    chain_hedge = ticker.option_chain(hedge_exp)
+except Exception as e:
+    st.error(f"Could not fetch hedge chain for {hedge_exp}: {e}")
+    st.stop()
+
+puts_df = chain_hedge.puts.dropna(subset=["strike", "bid", "ask", "impliedVolatility"])
+if puts_df.empty:
+    st.error(f"No puts available for {hedge_exp}.")
+    st.stop()
+
+long_target = S0 * (1.0 - drop_pct / 100.0)
+width_dollars = S0 * (drop_pct / 2.0) / 100.0
+short_target = long_target - width_dollars
+
+long_strike = nearest_strike(puts_df["strike"], long_target)
+short_strike = nearest_strike(puts_df["strike"], short_target)
+
+row_long = puts_df[puts_df["strike"] == long_strike].iloc[0]
+row_short = puts_df[puts_df["strike"] == short_strike].iloc[0]
+
+long_mid = float((row_long["bid"] + row_long["ask"]) / 2.0)
+short_mid = float((row_short["bid"] + row_short["ask"]) / 2.0)
+spread_cost_live = long_mid - short_mid
+put_iv_now = float(row_long["impliedVolatility"] * 100)
+
+st.markdown(
+    f"**Scenario hedge:** target exp ~ {target_exp_days}d → picked **{hedge_exp}** | "
+    f"strikes **{long_strike:.0f}/{short_strike:.0f}** | live spread ≈ **${spread_cost_live:.2f}** | "
+    f"put IV ≈ **{put_iv_now:.1f}%**"
+)
+
+# ---------- Auto IV crush estimate (term structure) ----------
+if use_auto_iv:
+    auto_crush, short_exp_used, long_exp_used = auto_iv_crush_estimate(
+        ticker, S0, days_short=target_exp_days, today=today
+    )
+    if auto_crush is not None:
+        iv_crush = auto_crush
+        st.success(
+            f"📉 Auto IV Crush ≈ {iv_crush:.1f}% "
+            + (f"(term: {short_exp_used} → {long_exp_used})" if short_exp_used and long_exp_used else "")
+        )
+    else:
+        iv_crush = float(manual_iv_crush)
+        st.warning("Auto IV crush unavailable — using manual setting.")
+else:
+    iv_crush = float(manual_iv_crush)
+    st.info(f"Manual IV Crush: {iv_crush:.1f}%")
+
+# ---------- Simulation engine ----------
+def simulate_ratio(hedge_ratio, hedge_exp, up_strike, low_strike, put_iv_now, spread_cost):
+    # Size hedge contracts by delta coverage
+    T_call = max(0.0, (datetime.strptime(call_exp, "%Y-%m-%d") - today).days / 365.0)
+    call_delta = bs_delta(S0, call_strike, T_call, call_iv_now / 100.0, "C")
+    total_call_delta = call_delta * num_calls * 100.0
+
+    T_put = max(0.0, (datetime.strptime(hedge_exp, "%Y-%m-%d") - today).days / 365.0)
+    put_delta = abs(bs_delta(S0, up_strike, T_put, put_iv_now / 100.0, "P")) * 100.0
+
+    hedge_contracts = max(1, int(round((total_call_delta * (hedge_ratio / 100.0)) / max(put_delta, 1e-9))))
+
+    # Price grid near spot
+    prices = np.arange(S0 * 0.9, S0 * 1.1 + 1e-9, 2.0)
+
+    # Exit-time assumptions
+    T_exit_call = max(0.0, (datetime.strptime(call_exp, "%Y-%m-%d") - today - timedelta(days=days_until_exit)).days / 365.0)
+    T_exit_put  = max(0.0, (datetime.strptime(hedge_exp, "%Y-%m-%d") - today - timedelta(days=days_until_exit)).days / 365.0)
+
+    adj_call_iv = max(1e-6, call_iv_now * (1.0 - iv_crush / 100.0))
+    adj_put_iv  = max(1e-6, put_iv_now  * (1.0 - iv_crush / 100.0))
 
     def val(S, K, T, sigma, opt_type):
-        return bs_price(S, K, T, r, sigma / 100, opt_type)
+        return bs_price(S, K, T, r, sigma / 100.0, opt_type)
 
-    call_val = np.array([val(p, call_strike, T_exit_call, iv_call_new, "C") for p in prices])
-    put_up = np.array([val(p, up_strike, T_put - days_until_exit / 365, iv_put_new, "P") for p in prices])
-    put_lo = np.array([val(p, low_strike, T_put - days_until_exit / 365, iv_put_new, "P") for p in prices])
+    call_val = np.array([val(p, call_strike, T_exit_call, adj_call_iv, "C") for p in prices])
+    put_up   = np.array([val(p, up_strike,  T_exit_put,  adj_put_iv,  "P") for p in prices])
+    put_lo   = np.array([val(p, low_strike, T_exit_put,  adj_put_iv,  "P") for p in prices])
 
-    call_ret = (call_val - call_cost_basis) * num_calls * 100
-    hedge_ret = hedge_contracts * ((put_up - put_lo) - cost_basis) * 100
-    total = call_ret + hedge_ret
+    call_ret  = (call_val - call_cost_basis) * num_calls * 100.0
+    hedge_ret = hedge_contracts * ((put_up - put_lo) - spread_cost) * 100.0
+    total_pl  = call_ret + hedge_ret
 
-    return prices, hedge_contracts, call_ret, hedge_ret, total
+    return prices, hedge_contracts, call_ret, hedge_ret, total_pl
 
-# ---------- Compute independent structures for 20/50/80 ----------
-hedge_levels = [20, 50, 80]
-structures = {ratio: find_put_spread_for_ratio(ratio) for ratio in hedge_levels}
-
+# ---------- Run scenarios ----------
+hedge_levels = [20, 50, 80, custom_hedge_ratio]
 results = {}
+
 for ratio in hedge_levels:
-    s = structures[ratio]
-    p, c, cr, hr, t = simulate_ratio(ratio, s["exp"], s["up"], s["low"], s["iv"], s["cost"])
-    results[ratio] = {"contracts": c, "call": cr, "hedge": hr, "total": t, **s}
-
-# ---------- Custom hedge uses the 50%-style structure by default ----------
-custom_structure = find_put_spread_for_ratio(50)
-p, c, cr, hr, t = simulate_ratio(custom_hedge_ratio, custom_structure["exp"], custom_structure["up"],
-                                 custom_structure["low"], custom_structure["iv"], custom_structure["cost"])
-results["custom"] = {"contracts": c, "call": cr, "hedge": hr, "total": t, **custom_structure}
-
-# ---------- Optimizer metrics ----------
-def sharpe_like(pl):
-    mu = np.mean(pl)
-    sd = np.std(pl)
-    return mu / sd if sd > 1e-9 else np.nan
-
-def worst_case_downside(pl, prices, spot):
-    mask = prices <= spot
-    if not np.any(mask):
-        return np.nan
-    return np.min(pl[mask])
-
-# Evaluate discrete candidates (20/50/80/custom)
-scores = []
-for key, val in results.items():
-    tag = f"{key}%" if key != "custom" else f"Custom {custom_hedge_ratio:.0f}%"
-    total = val["total"]
-    if objective == "Maximize Risk-Adjusted Return":
-        score = sharpe_like(total)
-        better_higher = True
-    else:
-        score = worst_case_downside(total, p, S0 * (1 - downside_only_region / 100))  # worst within downside band
-        better_higher = True  # less negative (higher) is better
-
-    scores.append({"Scenario": tag, "Score": score, "Contracts": val["contracts"],
-                   "Exp": val["exp"], "Strikes": f"{val['up']:.0f}/{val['low']:.0f}", "Cost/Spread": val["cost"]})
-
-# Pick best among discrete candidates
-scores_df = pd.DataFrame(scores)
-if objective == "Maximize Risk-Adjusted Return":
-    best_idx = scores_df["Score"].idxmax()
-else:
-    best_idx = scores_df["Score"].idxmax()
-best_discrete = scores_df.loc[best_idx]
-
-# Optional: sweep 0–100% for "optimal" custom ratio using the balanced structure
-sweep_best = None
-sweep_table = None
-if sweep_enable:
-    sweep_rows = []
-    for ratio in range(0, 101, 5):
-        p_s, c_s, cr_s, hr_s, t_s = simulate_ratio(
-            ratio,
-            custom_structure["exp"], custom_structure["up"],
-            custom_structure["low"], custom_structure["iv"], custom_structure["cost"]
-        )
-        if objective == "Maximize Risk-Adjusted Return":
-            score = sharpe_like(t_s)
-        else:
-            score = worst_case_downside(t_s, p_s, S0 * (1 - downside_only_region / 100))
-        sweep_rows.append({"Ratio%": ratio, "Score": score, "Contracts": c_s})
-    sweep_table = pd.DataFrame(sweep_rows)
-    # choose best according to objective
-    sweep_best = sweep_table.iloc[sweep_table["Score"].idxmax()]
+    p, cts, cr, hr, tot = simulate_ratio(
+        ratio, hedge_exp, long_strike, short_strike, put_iv_now, spread_cost_live
+    )
+    results[ratio] = {
+        "contracts": cts, "call": cr, "hedge": hr, "total": tot
+    }
 
 # ---------- Chart ----------
-st.header("📊 P/L Comparison Across Hedge Structures")
+st.header("📊 P/L Comparison (vs Cost Basis)")
 fig, ax = plt.subplots()
-palette = {20: None, 50: None, 80: None, "custom": None}
-for key, val in results.items():
-    label = f"{key}% Hedge ({val['contracts']} spd)" if key != "custom" else f"Custom {custom_hedge_ratio:.0f}% ({val['contracts']} spd)"
-    ax.plot(p, val["total"], label=label, linewidth=2)
+for ratio in hedge_levels:
+    label = f"{ratio:.0f}% Hedge ({results[ratio]['contracts']} spd)" if ratio != custom_hedge_ratio else f"Custom {ratio:.0f}% ({results[ratio]['contracts']} spd)"
+    ax.plot(p, results[ratio]["total"], label=label, linewidth=2)
 ax.plot(p, results[50]["call"], "--", color="black", label="Unhedged Calls Only")
 ax.axhline(0, color="gray", linestyle="--")
 ax.set_xlabel("Stock Price at Exit")
 ax.set_ylabel("Profit / Loss ($)")
-ax.set_title(f"{symbol} - Projected Returns ({days_until_exit} days ahead)")
+ax.set_title(f"{symbol} - Projected Returns ({days_until_exit} days ahead) — Hedging {drop_pct}% over {risk_window_days}d")
 ax.legend()
 st.pyplot(fig)
 
-# ---------- P&L Table ----------
+# ---------- Table (with % Change first) ----------
 st.header("📋 Projected Returns by Stock Price (vs Cost Basis)")
-df = pd.DataFrame({"Stock Price": p, "Call Return": results[50]["call"]})
-for key, val in results.items():
-    tag = f"{key}%" if key != "custom" else f"Custom {custom_hedge_ratio:.0f}%"
-    df[f"Hedge {tag} Return"] = val["hedge"]
-    df[f"Total P/L {tag}"] = val["total"]
-st.dataframe(df.set_index("Stock Price").style.format("{:.0f}"))
+pct_change = ((p / S0) - 1.0) * 100.0
+df = pd.DataFrame({"% Change": pct_change, "Stock Price": p, "Call Return": results[50]["call"]})
+for ratio in hedge_levels:
+    tag = f"{ratio:.0f}%"
+    df[f"Hedge {tag} Return"] = results[ratio]["hedge"]
+    df[f"Total P/L {tag}"]   = results[ratio]["total"]
+st.dataframe(df.set_index(["% Change", "Stock Price"]).style.format("{:.0f}"))
 
-# ---------- Recommendation Panel ----------
-st.subheader("🧠 Optimal Hedge — Recommendation")
-colA, colB = st.columns(2)
+# ---------- Quick Recommendation (pick best worst-case in downside band = drop_pct) ----------
+def worst_case(pl, prices, drop_pct):
+    band = prices <= (S0 * (1 - drop_pct / 100.0))
+    if not np.any(band):  # if grid doesn't include the band, fallback to min total
+        return np.min(pl)
+    return np.min(pl[band])
 
-with colA:
-    st.markdown("**Best among 20% / 50% / 80% / Custom**")
-    st.write(f"- **Objective:** {objective}")
-    st.write(f"- **Recommended:** {best_discrete['Scenario']}")
-    st.write(f"- **Score:** {best_discrete['Score']:.4f}")
-    st.write(f"- **Contracts:** {int(best_discrete['Contracts'])}")
-    st.write(f"- **Structure:** {symbol} {best_discrete['Exp']} {best_discrete['Strikes']} Put Spread")
-    st.write(f"- **Cost/Spread:** ${float(best_discrete['Cost/Spread']):.2f}")
+best_key = None
+best_score = -1e18
+for ratio in hedge_levels:
+    score = worst_case(results[ratio]["total"], p, drop_pct)
+    # less negative is better -> higher numeric value
+    if best_key is None or score > best_score:
+        best_key, best_score = ratio, score
 
-with colB:
-    if sweep_enable and sweep_best is not None:
-        st.markdown("**Best Custom Ratio (0–100%, balanced structure)**")
-        st.write(f"- **Objective:** {objective}")
-        st.write(f"- **Optimal Ratio:** {int(sweep_best['Ratio%'])}%")
-        st.write(f"- **Score:** {sweep_best['Score']:.4f}")
-        st.write(f"- **Contracts:** {int(sweep_best['Contracts'])}")
-        st.caption("Custom sweep uses the balanced (50%) expiry/strikes; only the ratio (and thus contracts) is varied.")
+st.subheader("🧠 Suggested Hedge (focus: worst-case within your drop%)")
+st.markdown(
+    f"- **{best_key:.0f}% Hedge** → {results[best_key]['contracts']}× {symbol} {hedge_exp} "
+    f"{long_strike:.0f}/{short_strike:.0f} Put Spread @ ~${spread_cost_live:.2f}/spread"
+)
 
-# ---------- Details for each hedge ----------
-st.subheader("🧾 Hedge Position Details")
-for key, val in results.items():
-    tag = f"{key}%" if key != "custom" else f"Custom {custom_hedge_ratio:.0f}%"
-    total_cost = val["contracts"] * val["cost"] * 100
-    st.markdown(
-        f"- **{tag} Hedge:** {val['contracts']}× {symbol} {val['exp']} "
-        f"{val['up']:.0f}/{val['low']:.0f} Put Spread | Cost ${val['cost']:.2f}/spread → **Total ≈ ${total_cost:.0f}**"
-    )
-
-# ---------- Optional: show optimizer sweep table ----------
-if sweep_enable and sweep_table is not None:
-    st.markdown("#### Optimizer Sweep (balanced structure)")
-    st.dataframe(sweep_table.set_index("Ratio%").style.format("{:.4f}", subset=["Score"]))
-
-# ---------- Copyable Summary Output ----------
+# ---------- Copyable Summary ----------
 st.divider()
 st.subheader("🧾 Copyable Results Summary")
 
 summary_lines = [
-    "=== OPTIONS HEDGE OPTIMIZER RESULTS ===",
+    "=== OPTIONS HEDGE OPTIMIZER RESULTS (v9) ===",
     f"Symbol: {symbol}",
     f"Spot: {S0:.2f}",
-    f"Call Strike: {call_strike}  | Exp: {call_exp}  | Contracts: {num_calls}  | Cost Basis: ${call_cost_basis}",
-    f"Days Until Exit: {days_until_exit}",
-    f"IV Crush: {manual_iv_crush}%",
-    f"Custom Hedge: {custom_hedge_ratio}%",
-    f"Objective: {objective}",
-    "-"*40,
-    f"Best Discrete Hedge: {best_discrete['Scenario']} ({symbol} {best_discrete['Exp']} {best_discrete['Strikes']} Put Spread)",
-    f"Contracts: {int(best_discrete['Contracts'])} | Cost/Spread: ${float(best_discrete['Cost/Spread']):.2f} | Score: {best_discrete['Score']:.4f}",
+    f"Your Calls: {num_calls}× {symbol} {call_exp} {call_strike}C @ ${call_cost_basis:.2f} (mid ~ ${call_mid:.2f}, IV ~ {call_iv_now:.1f}%)",
+    f"Hedging Against: -{drop_pct}% over {risk_window_days} days  |  Expected Upside: +{expected_upside_pct}%",
+    f"Hedge Structure: {symbol} {hedge_exp} {long_strike:.0f}/{short_strike:.0f} Put Spread (live cost ~ ${spread_cost_live:.2f}, put IV ~ {put_iv_now:.1f}%)",
+    f"IV Crush: {'AUTO' if use_auto_iv else 'MANUAL'} -> {iv_crush:.1f}%",
+    f"P/L Snapshot Horizon: {days_until_exit} days",
+    "-"*44,
 ]
-
-if sweep_enable and sweep_best is not None:
-    summary_lines += [
-        f"Optimal Custom Ratio (sweep): {int(sweep_best['Ratio%'])}%",
-        f"Sweep Score: {sweep_best['Score']:.4f}",
-    ]
-
-summary_lines.append("-"*40)
-summary_lines.append("Hedge Structures:")
-for key, val in results.items():
-    tag = f"{key}%" if key != "custom" else f"Custom {custom_hedge_ratio:.0f}%"
+for ratio in hedge_levels:
     summary_lines.append(
-        f"  {tag} -> {val['up']:.0f}/{val['low']:.0f} exp {val['exp']} | cost ${val['cost']:.2f} | contracts {val['contracts']}"
+        f"{ratio:.0f}% Hedge -> contracts {results[ratio]['contracts']}"
     )
+summary_lines.append("-"*44)
+summary_lines.append("Table Columns: %Change | Stock Price | Call Return | Hedge Returns (20/50/80/Custom) | Total P/L (20/50/80/Custom)")
 
 copy_block = "\n".join(summary_lines)
+st.text_area("Copy these results:", value=copy_block, height=260)
 
-st.text_area(
-    "Full Text Summary (copy below to paste into ChatGPT or your notes):",
-    value=copy_block,
-    height=260,
-)
+# Optional download button
+st.download_button("Download Results (.txt)", data=copy_block, file_name=f"{symbol}_hedge_results_v9.txt")
