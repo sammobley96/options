@@ -134,7 +134,12 @@ def style_tables(df: pd.DataFrame):
         return styles
 
     def alt_rows(row):
-        return ["background-color: #f2f2f2" if row.name % 2 else "background-color: #e9e9e9" for _ in row]
+        # transparent (none) on even rows, lightly shaded on odd rows
+        return [
+            "background-color: rgba(0, 0, 0, 0.0)" if row.name % 2 == 0
+            else "background-color: rgba(0, 0, 0, 0.05)"  # 90% transparent
+            for _ in row
+        ]
 
     styler = df.style.format(
         lambda x: ""
