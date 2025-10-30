@@ -323,3 +323,43 @@ for key, val in results.items():
 if sweep_enable and sweep_table is not None:
     st.markdown("#### Optimizer Sweep (balanced structure)")
     st.dataframe(sweep_table.set_index("Ratio%").style.format("{:.4f}", subset=["Score"]))
+
+# ---------- Copyable Summary Output ----------
+st.divider()
+st.subheader("🧾 Copyable Results Summary")
+
+summary_lines = [
+    "=== OPTIONS HEDGE OPTIMIZER RESULTS ===",
+    f"Symbol: {symbol}",
+    f"Spot: {S0:.2f}",
+    f"Call Strike: {call_strike}  | Exp: {call_exp}  | Contracts: {num_calls}  | Cost Basis: ${call_cost_basis}",
+    f"Days Until Exit: {days_until_exit}",
+    f"IV Crush: {manual_iv_crush}%",
+    f"Custom Hedge: {custom_hedge_ratio}%",
+    f"Objective: {objective}",
+    "-"*40,
+    f"Best Discrete Hedge: {best_discrete['Scenario']} ({symbol} {best_discrete['Exp']} {best_discrete['Strikes']} Put Spread)",
+    f"Contracts: {int(best_discrete['Contracts'])} | Cost/Spread: ${float(best_discrete['Cost/Spread']):.2f} | Score: {best_discrete['Score']:.4f}",
+]
+
+if sweep_enable and sweep_best is not None:
+    summary_lines += [
+        f"Optimal Custom Ratio (sweep): {int(sweep_best['Ratio%'])}%",
+        f"Sweep Score: {sweep_best['Score']:.4f}",
+    ]
+
+summary_lines.append("-"*40)
+summary_lines.append("Hedge Structures:")
+for key, val in results.items():
+    tag = f"{key}%" if key != "custom" else f"Custom {custom_hedge_ratio:.0f}%"
+    summary_lines.append(
+        f"  {tag} -> {val['up']:.0f}/{val['low']:.0f} exp {val['exp']} | cost ${val['cost']:.2f} | contracts {val['contracts']}"
+    )
+
+copy_block = "\n".join(summary_lines)
+
+st.text_area(
+    "Full Text Summary (copy below to paste into ChatGPT or your notes):",
+    value=copy_block,
+    height=260,
+)
