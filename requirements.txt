@@ -1,0 +1,29 @@
+# Core app framework
+streamlit>=1.36
+
+# Data handling & numerical libraries
+pandas>=2.0
+numpy>=1.26
+
+# Visualization
+matplotlib>=3.8
+plotly>=5.20  # optional: interactive charts if you add them later
+
+# Finance & data APIs
+yfinance>=0.2.43
+pandas_datareader>=0.10  # optional: supports FRED, IEX, etc.
+
+# Statistical & modeling tools
+scipy>=1.12
+statsmodels>=0.14  # optional: regressions / volatility models
+
+# Web requests & caching
+requests>=2.31
+lxml>=5.2  # ensures robust scraping when yfinance needs parsing
+
+# For local time handling & timezone safety
+pytz>=2024.1
+python-dateutil>=2.9
+
+# Optional UI / formatting enhancements
+altair>=5.2  # if you add richer charts to the dashboard
