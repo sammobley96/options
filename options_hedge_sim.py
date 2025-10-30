@@ -5,9 +5,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from math import log, sqrt, exp
 from scipy.stats import norm
+from scipy.interpolate import PchipInterpolator
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Options Hedge Optimizer — Scenario v9.1", layout="wide")
+st.set_page_config(page_title="Options Hedge Optimizer — Surface v10", layout="wide")
 plt.rcParams["axes.unicode_minus"] = False
 
 # ---------- Black-Scholes ----------
@@ -110,8 +111,54 @@ def scaled_call_iv_after_crush(call_iv_now_pct, iv_crush_short_pct,
     }
     return iv_new, info
 
+# ---------- Surface builders ----------
+def build_iv_curve_for_exp(ticker, exp, spot, kind="calls_and_puts"):
+    """
+    Build a smooth IV curve vs log-moneyness (ln(K/spot)) for a given expiration.
+    Uses PCHIP (shape-preserving) to avoid oscillations.
+    kind: "puts", "calls", or "calls_and_puts"
+    Returns: (interp_fn, m_grid, iv_grid_pct)
+    """
+    ch = ticker.option_chain(exp)
+    frames = []
+    if kind in ("calls", "calls_and_puts"):
+        c = ch.calls.dropna(subset=["strike", "impliedVolatility"])
+        if not c.empty:
+            frames.append(c[["strike", "impliedVolatility"]].assign(side="C"))
+    if kind in ("puts", "calls_and_puts"):
+        p = ch.puts.dropna(subset=["strike", "impliedVolatility"])
+        if not p.empty:
+            frames.append(p[["strike", "impliedVolatility"]].assign(side="P"))
+
+    if not frames:
+        return None, None, None
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.dropna()
+    if df.empty:
+        return None, None, None
+
+    df["mny"] = np.log(df["strike"].astype(float) / float(spot))
+    df = df.sort_values("mny")
+    df = df.groupby("mny", as_index=False)["impliedVolatility"].median()  # de-dup
+
+    x = df["mny"].values
+    y = (df["impliedVolatility"].values * 100.0)  # to %
+    if len(x) < 3:
+        return None, x, y
+
+    interp = PchipInterpolator(x, y, extrapolate=True)
+    return interp, x, y
+
+def iv_from_surface(interp, S_new, K):
+    """Return IV% from the curve at the log-moneyness of K vs S_new."""
+    if interp is None:
+        return None
+    mny = np.log(float(K) / float(S_new))
+    return float(np.maximum(1e-6, interp(mny)))
+
 # ---------- UI ----------
-st.title("🎯 Options Hedge Optimizer — Scenario-driven (v9.1)")
+st.title("🎯 Options Hedge Optimizer — Surface-based (v10)")
 
 left, right = st.columns(2)
 with left:
@@ -133,12 +180,14 @@ with sc2:
 with sc3:
     expected_upside_pct = st.slider("🚀 Expected Upside (%)", 0, 20, 5)
 
-st.markdown("#### Volatility")
-v1, v2 = st.columns([1,1])
+st.markdown("#### Volatility & Surface Dynamics")
+v1, v2, v3 = st.columns([1,1,1])
 with v1:
-    use_auto_iv = st.checkbox("Use automatic IV calibration", value=True)
+    use_auto_iv = st.checkbox("Use automatic IV calibration (term crush)", value=True)
 with v2:
     manual_iv_crush = st.slider("Manual IV Crush (%) (if auto unavailable)", 0, 60, 15)
+with v3:
+    dyn_mode = st.selectbox("IV surface dynamics", ["Sticky-Delta (preserve moneyness)", "Sticky-Strike (preserve strike)"])
 
 r = 0.05
 today = datetime.today()
@@ -231,69 +280,109 @@ else:
     iv_crush = float(manual_iv_crush)
     st.info(f"Manual IV Crush: {iv_crush:.1f}%")
 
-# ---------- Simulation engine ----------
-def simulate_ratio(hedge_ratio, hedge_exp, up_strike, low_strike, put_iv_now, spread_cost,
-                   call_iv_now, call_exp, risk_window_days, today, ticker, S0):
+# ---------- Build IV surfaces for call & hedge expiries ----------
+call_curve, _, _  = build_iv_curve_for_exp(ticker, call_exp,  S0, kind="calls_and_puts")
+hedge_curve, _, _ = build_iv_curve_for_exp(ticker, hedge_exp, S0, kind="calls_and_puts")
+
+def scenario_iv_from_curve(curve, S_ref, S_scn, K, mode):
+    if curve is None:
+        return None
+    if mode.startswith("Sticky-Delta"):  # preserve moneyness vs new spot
+        return iv_from_surface(curve, S_scn, K)
+    else:  # Sticky-Strike: preserve strike moneyness vs original spot
+        return iv_from_surface(curve, S_ref, K)
+
+def atm_iv_from_curve(curve, S_ref):
+    if curve is None:
+        return None
+    return iv_from_surface(curve, S_ref, S_ref)
+
+# ATM levels now (for crush shifting)
+call_atm_now  = atm_iv_from_curve(call_curve,  S0) if call_curve else call_iv_now
+hedge_atm_now = atm_iv_from_curve(hedge_curve, S0) if hedge_curve else put_iv_now
+
+# Scaled crush for CALL ATM; full crush for hedge ATM
+scaled_call_atm_after, _ivinfo = scaled_call_iv_after_crush(
+    call_iv_now_pct = call_atm_now if call_atm_now else call_iv_now,
+    iv_crush_short_pct = iv_crush,
+    call_exp_str = call_exp,
+    risk_window_days = risk_window_days,
+    today = today, ticker = ticker, spot = S0
+)
+hedge_atm_after = max(1e-6, (hedge_atm_now if hedge_atm_now else put_iv_now) * (1.0 - iv_crush/100.0))
+
+def crush_shifted_iv(base_iv, atm_now, atm_after):
+    if base_iv is None:
+        return None
+    if (atm_now is None) or (atm_after is None):
+        return max(1e-6, base_iv)
+    return max(1e-6, base_iv + (atm_after - atm_now))
+
+# ---------- Simulation engine (surface-based IV) ----------
+def simulate_ratio_surface(hedge_ratio):
     # Size hedge contracts by delta coverage (current greeks)
     T_call = max(0.0, (datetime.strptime(call_exp, "%Y-%m-%d") - today).days / 365.0)
-    call_delta = bs_delta(S0, call_strike, T_call, call_iv_now / 100.0, "C")
-    total_call_delta = call_delta * num_calls * 100.0
+    call_delta_now = bs_delta(S0, call_strike, T_call, call_iv_now / 100.0, "C")
+    total_call_delta = call_delta_now * num_calls * 100.0
 
     T_put = max(0.0, (datetime.strptime(hedge_exp, "%Y-%m-%d") - today).days / 365.0)
-    put_delta = abs(bs_delta(S0, up_strike, T_put, put_iv_now / 100.0, "P")) * 100.0
+    put_delta_now = abs(bs_delta(S0, long_strike, T_put, put_iv_now / 100.0, "P")) * 100.0
 
-    hedge_contracts = max(1, int(round((total_call_delta * (hedge_ratio / 100.0)) / max(put_delta, 1e-9))))
+    hedge_contracts = max(1, int(round((total_call_delta * (hedge_ratio / 100.0)) / max(put_delta_now, 1e-9))))
 
     # Price grid near spot
     prices = np.arange(S0 * 0.9, S0 * 1.1 + 1e-9, 2.0)
 
-    # Exit-time assumptions
+    # Exit-time T (after your snapshot horizon)
     T_exit_call = max(0.0, (datetime.strptime(call_exp, "%Y-%m-%d") - today - timedelta(days=days_until_exit)).days / 365.0)
     T_exit_put  = max(0.0, (datetime.strptime(hedge_exp, "%Y-%m-%d") - today - timedelta(days=days_until_exit)).days / 365.0)
 
-    # --- Scaled crush for the CALL (key fix) ---
-    adj_call_iv, iv_scale_info = scaled_call_iv_after_crush(
-        call_iv_now_pct=call_iv_now,
-        iv_crush_short_pct=iv_crush,
-        call_exp_str=call_exp,
-        risk_window_days=risk_window_days,
-        today=today,
-        ticker=ticker,
-        spot=S0
-    )
-    # Full crush on the short-dated hedge
-    adj_put_iv  = max(1e-6, put_iv_now * (1.0 - iv_crush / 100.0))
+    call_vals, put_up_vals, put_lo_vals = [], [], []
 
-    def val(S, K, T, sigma, opt_type):
-        return bs_price(S, K, T, r, sigma / 100.0, opt_type)
+    for S_scn in prices:
+        # Pull base IVs from surfaces per scenario & dynamics
+        base_iv_call = scenario_iv_from_curve(call_curve, S0, S_scn, call_strike, dyn_mode)
+        base_iv_up   = scenario_iv_from_curve(hedge_curve, S0, S_scn, long_strike, dyn_mode)
+        base_iv_lo   = scenario_iv_from_curve(hedge_curve, S0, S_scn, short_strike, dyn_mode)
 
-    call_val = np.array([val(p, call_strike, T_exit_call, adj_call_iv, "C") for p in prices])
-    put_up   = np.array([val(p, up_strike,  T_exit_put,  adj_put_iv,  "P") for p in prices])
-    put_lo   = np.array([val(p, low_strike, T_exit_put,  adj_put_iv,  "P") for p in prices])
+        # Apply ATM-level crush shift (shape preserved)
+        iv_call_scn = crush_shifted_iv(base_iv_call if base_iv_call else call_iv_now, call_atm_now, scaled_call_atm_after)
+        iv_up_scn   = crush_shifted_iv(base_iv_up   if base_iv_up   else put_iv_now,  hedge_atm_now, hedge_atm_after)
+        iv_lo_scn   = crush_shifted_iv(base_iv_lo   if base_iv_lo   else put_iv_now,  hedge_atm_now, hedge_atm_after)
+
+        call_vals.append(bs_price(S_scn, call_strike, T_exit_call, r, iv_call_scn/100.0, "C"))
+        put_up_vals.append(bs_price(S_scn, long_strike,  T_exit_put, r, iv_up_scn/100.0,   "P"))
+        put_lo_vals.append(bs_price(S_scn, short_strike, T_exit_put, r, iv_lo_scn/100.0,   "P"))
+
+    call_val = np.array(call_vals)
+    put_up   = np.array(put_up_vals)
+    put_lo   = np.array(put_lo_vals)
 
     call_ret  = (call_val - call_cost_basis) * num_calls * 100.0
-    hedge_ret = hedge_contracts * ((put_up - put_lo) - spread_cost) * 100.0
+    hedge_ret = hedge_contracts * ((put_up - put_lo) - spread_cost_live) * 100.0
     total_pl  = call_ret + hedge_ret
 
-    # Sanity snapshot (return some info for one move for diagnostics)
+    # Sanity snapshot at +0.8%
     target_move_pct = 0.8
     S_target = S0 * (1 + target_move_pct / 100.0)
-    call_val_target = val(S_target, call_strike, T_exit_call, adj_call_iv, "C")
-    call_delta_now = bs_delta(S0, call_strike, T_call, call_iv_now/100.0, "C")
+    base_iv_call_t = scenario_iv_from_curve(call_curve, S0, S_target, call_strike, dyn_mode)
+    iv_call_t = crush_shifted_iv(base_iv_call_t if base_iv_call_t else call_iv_now, call_atm_now, scaled_call_atm_after)
+    call_val_target = bs_price(S_target, call_strike, T_exit_call, r, iv_call_t/100.0, "C")
+
+    # approximate decomp
     def _price_call(S, iv_pct):
         return bs_price(S, call_strike, T_exit_call, r, iv_pct/100.0, "C")
-    vega_bump = max(1e-6, _price_call(S0, adj_call_iv + 1.0) - _price_call(S0, adj_call_iv))
+    vega_bump = max(1e-6, _price_call(S0, (scaled_call_atm_after + 1.0)) - _price_call(S0, scaled_call_atm_after))
     dS = S_target - S0
-    dIV_pts = (adj_call_iv - call_iv_now)  # negative on crush
+    dIV_pts = (scaled_call_atm_after - (call_atm_now if call_atm_now else call_iv_now))
     delta_gain = call_delta_now * dS
-    call_val_now_exitIV = val(S0, call_strike, T_exit_call, adj_call_iv, "C")
+    call_val_now_exitIV = _price_call(S0, scaled_call_atm_after)
     theta_like = (call_val_target - call_val_now_exitIV) - delta_gain
     call_pnl_total = (call_val_target - call_cost_basis) * 100.0 * num_calls
 
     sanity = {
         "target_move_pct": target_move_pct,
-        "adj_call_iv": adj_call_iv,
-        "iv_scale_info": iv_scale_info,
+        "adj_call_iv": scaled_call_atm_after,
         "call_delta_now": call_delta_now,
         "vega_bump": vega_bump,
         "delta_gain_total": delta_gain * 100.0 * num_calls,
@@ -310,12 +399,9 @@ results = {}
 sanity_ref = None
 
 for ratio in hedge_levels:
-    p, cts, cr, hr, tot, sanity = simulate_ratio(
-        ratio, hedge_exp, long_strike, short_strike, put_iv_now, spread_cost_live,
-        call_iv_now, call_exp, risk_window_days, today, ticker, S0
-    )
+    p, cts, cr, hr, tot, sanity = simulate_ratio_surface(ratio)
     results[ratio] = {"contracts": cts, "call": cr, "hedge": hr, "total": tot}
-    if ratio == 50:  # keep a reference sanity breakdown on the 50% run
+    if ratio == 50:
         sanity_ref = sanity
 
 # ---------- Chart ----------
@@ -328,7 +414,7 @@ ax.plot(p, results[50]["call"], "--", color="black", label="Unhedged Calls Only"
 ax.axhline(0, color="gray", linestyle="--")
 ax.set_xlabel("Stock Price at Exit")
 ax.set_ylabel("Profit / Loss ($)")
-ax.set_title(f"{symbol} - Projected Returns ({days_until_exit} days ahead) — Hedging {drop_pct}% over {risk_window_days}d")
+ax.set_title(f"{symbol} — Projected Returns ({days_until_exit} days ahead) — Hedging {drop_pct}% over {risk_window_days}d ({dyn_mode})")
 ax.legend()
 st.pyplot(fig)
 
@@ -365,12 +451,9 @@ st.markdown(
 # ---------- Sanity panel for the call @ +0.8% ----------
 if sanity_ref:
     st.subheader("🔍 Call P/L Sanity at +0.8% move (decomposition)")
-    st.caption("Breaks your call’s next-day P/L into Delta gain, Vega (from IV crush), and a Theta-like term.")
+    st.caption("Breaks your call’s next-day P/L into Delta gain, Vega (IV shift), and a Theta-like term.")
     st.write(
-        f"- Adj Call IV after scaled crush: **{sanity_ref['adj_call_iv']:.2f}%** "
-        f"(time fraction ≈ {sanity_ref['iv_scale_info']['frac_time']:.2f}, "
-        f"crush pts applied ≈ {sanity_ref['iv_scale_info']['crush_pts_call']:.2f}, "
-        f"floor ≈ {sanity_ref['iv_scale_info']['iv_floor'] if sanity_ref['iv_scale_info']['iv_floor'] else 'n/a'})"
+        f"- Scaled ATM Call IV after crush: **{sanity_ref['adj_call_iv']:.2f}%** "
     )
     st.write(
         f"- Δ (now) ≈ {sanity_ref['call_delta_now']:.2f} | "
@@ -388,13 +471,14 @@ st.divider()
 st.subheader("🧾 Copyable Results Summary")
 
 summary_lines = [
-    "=== OPTIONS HEDGE OPTIMIZER RESULTS (v9.1) ===",
+    "=== OPTIONS HEDGE OPTIMIZER RESULTS (v10) ===",
     f"Symbol: {symbol}",
     f"Spot: {S0:.2f}",
     f"Your Calls: {num_calls}× {symbol} {call_exp} {call_strike}C @ ${call_cost_basis:.2f} (mid ~ ${call_mid:.2f}, IV ~ {call_iv_now:.1f}%)",
     f"Hedging Against: -{drop_pct}% over {risk_window_days} days  |  Expected Upside: +{expected_upside_pct}%",
+    f"Surface Dynamics: {dyn_mode}",
     f"Hedge Structure: {symbol} {hedge_exp} {long_strike:.0f}/{short_strike:.0f} Put Spread (live cost ~ ${spread_cost_live:.2f}, put IV ~ {put_iv_now:.1f}%)",
-    f"IV Crush (auto->call scaled): {iv_crush:.1f}%  |  Scaled call IV ≈ {sanity_ref['adj_call_iv']:.2f}%" if sanity_ref else f"IV Crush: {iv_crush:.1f}%",
+    f"IV Crush (auto->call scaled ATM, skew preserved): {iv_crush:.1f}%",
     f"P/L Snapshot Horizon: {days_until_exit} days",
     "-"*44,
 ]
@@ -405,4 +489,4 @@ summary_lines.append("Table Columns: %Change | Stock Price | Call Return | Hedge
 
 copy_block = "\n".join(summary_lines)
 st.text_area("Copy these results:", value=copy_block, height=260)
-st.download_button("Download Results (.txt)", data=copy_block, file_name=f"{symbol}_hedge_results_v9_1.txt")
+st.download_button("Download Results (.txt)", data=copy_block, file_name=f"{symbol}_hedge_results_v10.txt")
